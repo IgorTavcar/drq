@@ -1,9 +1,15 @@
 #! /usr/bin/env python
 # coding: utf-8
+"""
+Numba-optimized MARS implementation.
+Core memory and task queues use numpy arrays for JIT compilation.
+"""
 
-from copy import copy
-import operator
+from collections import deque
 from random import randint
+
+import numpy as np
+from numba import njit
 
 from .core import Core, DEFAULT_INITIAL_INSTRUCTION
 from .redcode import *
@@ -28,463 +34,645 @@ EVENT_B_WRITE  = 10
 EVENT_A_ARITH  = 11
 EVENT_B_ARITH  = 12
 
-class MARS(object):
-    """The MARS. Encapsulates a simulation.
+# Redcode constants (duplicated here for numba)
+# Opcodes
+_DAT = 0
+_MOV = 1
+_ADD = 2
+_SUB = 3
+_MUL = 4
+_DIV = 5
+_MOD = 6
+_JMP = 7
+_JMZ = 8
+_JMN = 9
+_DJN = 10
+_SPL = 11
+_SLT = 12
+_CMP = 13
+_SEQ = 14
+_SNE = 15
+_NOP = 16
+
+# Modifiers
+_M_A  = 0
+_M_B  = 1
+_M_AB = 2
+_M_BA = 3
+_M_F  = 4
+_M_X  = 5
+_M_I  = 6
+
+# Address modes - must match redcode.py values
+_IMMEDIATE  = 0
+_DIRECT     = 1
+_INDIRECT_B = 2
+_PREDEC_B   = 3
+_POSTINC_B  = 4
+_INDIRECT_A = 5
+_PREDEC_A   = 6
+_POSTINC_A  = 7
+
+# Core array indices
+_OPCODE = 0
+_MODIFIER = 1
+_A_MODE = 2
+_B_MODE = 3
+_A_NUMBER = 4
+_B_NUMBER = 5
+
+
+@njit(cache=True)
+def _trim(value, coresize):
+    """Normalize address to core bounds."""
+    return value % coresize
+
+
+@njit(cache=True)
+def _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, warrior_idx, address, max_processes, coresize, coverage=None):
+    """Add a process to warrior's task queue (circular buffer)."""
+    if tq_sizes[warrior_idx] < max_processes:
+        trimmed = address % coresize
+        task_queues[warrior_idx, tq_tails[warrior_idx]] = trimmed
+        tq_tails[warrior_idx] = (tq_tails[warrior_idx] + 1) % max_processes
+        tq_sizes[warrior_idx] += 1
+        # Track coverage if array provided
+        if coverage is not None:
+            coverage[warrior_idx, trimmed] = True
+        return trimmed
+    return -1
+
+
+@njit(cache=True)
+def _dequeue(task_queues, tq_heads, tq_tails, tq_sizes, warrior_idx, max_processes):
+    """Remove and return next process from warrior's task queue."""
+    if tq_sizes[warrior_idx] > 0:
+        pc = task_queues[warrior_idx, tq_heads[warrior_idx]]
+        tq_heads[warrior_idx] = (tq_heads[warrior_idx] + 1) % max_processes
+        tq_sizes[warrior_idx] -= 1
+        return pc
+    return -1
+
+
+@njit(cache=True)
+def _step_numba(core, num_warriors, task_queues, tq_heads, tq_tails, tq_sizes,
+                coresize, max_processes, coverage=None):
+    """Execute one simulation step for all warriors.
+
+    core: (coresize, 6) int32 array - [opcode, modifier, a_mode, b_mode, a_number, b_number]
+    task_queues: (num_warriors, max_processes) int32 array - circular buffers
+    tq_heads, tq_tails, tq_sizes: (num_warriors,) int32 arrays - queue state
+    coverage: optional (num_warriors, coresize) bool array for tracking visited addresses
     """
 
+    for w_idx in range(num_warriors):
+        if tq_sizes[w_idx] == 0:
+            continue
+
+        # Dequeue next instruction address
+        pc = _dequeue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, max_processes)
+
+        # Load instruction register
+        ir_opcode = core[pc, _OPCODE]
+        ir_modifier = core[pc, _MODIFIER]
+        ir_a_mode = core[pc, _A_MODE]
+        ir_b_mode = core[pc, _B_MODE]
+        ir_a_number = core[pc, _A_NUMBER]
+        ir_b_number = core[pc, _B_NUMBER]
+
+        # Evaluate A-operand
+        pip_a = pc
+        if ir_a_mode == _IMMEDIATE:
+            rpa = 0
+            wpa = 0
+        else:
+            rpa = ir_a_number % coresize
+            wpa = rpa  # same initial value
+
+            if ir_a_mode != _DIRECT:
+                pip_a = (pc + wpa) % coresize
+
+                # Pre-decrement
+                if ir_a_mode == _PREDEC_A:
+                    core[pip_a, _A_NUMBER] -= 1
+                elif ir_a_mode == _PREDEC_B:
+                    core[pip_a, _B_NUMBER] -= 1
+
+                # Calculate indirect address
+                ref_addr = (pc + rpa) % coresize
+                if ir_a_mode == _PREDEC_A or ir_a_mode == _INDIRECT_A or ir_a_mode == _POSTINC_A:
+                    indirect_val = core[ref_addr, _A_NUMBER]
+                else:
+                    indirect_val = core[ref_addr, _B_NUMBER]
+
+                rpa = (rpa + indirect_val) % coresize
+                wpa = (wpa + indirect_val) % coresize
+
+        # Load instruction at A pointer (compute address once)
+        rpa_abs = (pc + rpa) % coresize
+        ira_opcode = core[rpa_abs, _OPCODE]
+        ira_modifier = core[rpa_abs, _MODIFIER]
+        ira_a_mode = core[rpa_abs, _A_MODE]
+        ira_b_mode = core[rpa_abs, _B_MODE]
+        ira_a_number = core[rpa_abs, _A_NUMBER]
+        ira_b_number = core[rpa_abs, _B_NUMBER]
+
+        # Post-increment for A
+        if ir_a_mode == _POSTINC_A:
+            core[pip_a, _A_NUMBER] += 1
+        elif ir_a_mode == _POSTINC_B:
+            core[pip_a, _B_NUMBER] += 1
+
+        # Evaluate B-operand
+        pip_b = pc
+        if ir_b_mode == _IMMEDIATE:
+            rpb = 0
+            wpb = 0
+        else:
+            rpb = ir_b_number % coresize
+            wpb = rpb
+
+            if ir_b_mode != _DIRECT:
+                pip_b = (pc + wpb) % coresize
+
+                # Pre-decrement
+                if ir_b_mode == _PREDEC_A:
+                    core[pip_b, _A_NUMBER] -= 1
+                elif ir_b_mode == _PREDEC_B:
+                    core[pip_b, _B_NUMBER] -= 1
+
+                # Calculate indirect address
+                ref_addr = (pc + rpb) % coresize
+                if ir_b_mode == _PREDEC_A or ir_b_mode == _INDIRECT_A or ir_b_mode == _POSTINC_A:
+                    indirect_val = core[ref_addr, _A_NUMBER]
+                else:
+                    indirect_val = core[ref_addr, _B_NUMBER]
+
+                rpb = (rpb + indirect_val) % coresize
+                wpb = (wpb + indirect_val) % coresize
+
+        # Load instruction at B pointer (compute address once)
+        rpb_abs = (pc + rpb) % coresize
+        irb_a_number = core[rpb_abs, _A_NUMBER]
+        irb_b_number = core[rpb_abs, _B_NUMBER]
+
+        # Post-increment for B
+        if ir_b_mode == _POSTINC_A:
+            core[pip_b, _A_NUMBER] += 1
+        elif ir_b_mode == _POSTINC_B:
+            core[pip_b, _B_NUMBER] += 1
+
+        # Absolute write address
+        wpb_abs = (pc + wpb) % coresize
+        
+        # Execute instruction
+        if ir_opcode == _DAT:
+            # Kill process - don't enqueue
+            pass
+            
+        elif ir_opcode == _MOV:
+            if ir_modifier == _M_A:
+                core[wpb_abs, _A_NUMBER] = ira_a_number
+            elif ir_modifier == _M_B:
+                core[wpb_abs, _B_NUMBER] = ira_b_number
+            elif ir_modifier == _M_AB:
+                core[wpb_abs, _B_NUMBER] = ira_a_number
+            elif ir_modifier == _M_BA:
+                core[wpb_abs, _A_NUMBER] = ira_b_number
+            elif ir_modifier == _M_F:
+                core[wpb_abs, _A_NUMBER] = ira_a_number
+                core[wpb_abs, _B_NUMBER] = ira_b_number
+            elif ir_modifier == _M_X:
+                core[wpb_abs, _A_NUMBER] = ira_b_number
+                core[wpb_abs, _B_NUMBER] = ira_a_number
+            elif ir_modifier == _M_I:
+                core[wpb_abs, _OPCODE] = ira_opcode
+                core[wpb_abs, _MODIFIER] = ira_modifier
+                core[wpb_abs, _A_MODE] = ira_a_mode
+                core[wpb_abs, _B_MODE] = ira_b_mode
+                core[wpb_abs, _A_NUMBER] = ira_a_number
+                core[wpb_abs, _B_NUMBER] = ira_b_number
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            
+        elif ir_opcode == _ADD:
+            if ir_modifier == _M_A:
+                core[wpb_abs, _A_NUMBER] = irb_a_number + ira_a_number
+            elif ir_modifier == _M_B:
+                core[wpb_abs, _B_NUMBER] = irb_b_number + ira_b_number
+            elif ir_modifier == _M_AB:
+                core[wpb_abs, _B_NUMBER] = irb_b_number + ira_a_number
+            elif ir_modifier == _M_BA:
+                core[wpb_abs, _A_NUMBER] = irb_a_number + ira_b_number
+            elif ir_modifier == _M_F or ir_modifier == _M_I:
+                core[wpb_abs, _A_NUMBER] = irb_a_number + ira_a_number
+                core[wpb_abs, _B_NUMBER] = irb_b_number + ira_b_number
+            elif ir_modifier == _M_X:
+                core[wpb_abs, _A_NUMBER] = irb_a_number + ira_b_number
+                core[wpb_abs, _B_NUMBER] = irb_b_number + ira_a_number
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            
+        elif ir_opcode == _SUB:
+            if ir_modifier == _M_A:
+                core[wpb_abs, _A_NUMBER] = irb_a_number - ira_a_number
+            elif ir_modifier == _M_B:
+                core[wpb_abs, _B_NUMBER] = irb_b_number - ira_b_number
+            elif ir_modifier == _M_AB:
+                core[wpb_abs, _B_NUMBER] = irb_b_number - ira_a_number
+            elif ir_modifier == _M_BA:
+                core[wpb_abs, _A_NUMBER] = irb_a_number - ira_b_number
+            elif ir_modifier == _M_F or ir_modifier == _M_I:
+                core[wpb_abs, _A_NUMBER] = irb_a_number - ira_a_number
+                core[wpb_abs, _B_NUMBER] = irb_b_number - ira_b_number
+            elif ir_modifier == _M_X:
+                core[wpb_abs, _A_NUMBER] = irb_a_number - ira_b_number
+                core[wpb_abs, _B_NUMBER] = irb_b_number - ira_a_number
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            
+        elif ir_opcode == _MUL:
+            if ir_modifier == _M_A:
+                core[wpb_abs, _A_NUMBER] = irb_a_number * ira_a_number
+            elif ir_modifier == _M_B:
+                core[wpb_abs, _B_NUMBER] = irb_b_number * ira_b_number
+            elif ir_modifier == _M_AB:
+                core[wpb_abs, _B_NUMBER] = irb_b_number * ira_a_number
+            elif ir_modifier == _M_BA:
+                core[wpb_abs, _A_NUMBER] = irb_a_number * ira_b_number
+            elif ir_modifier == _M_F or ir_modifier == _M_I:
+                core[wpb_abs, _A_NUMBER] = irb_a_number * ira_a_number
+                core[wpb_abs, _B_NUMBER] = irb_b_number * ira_b_number
+            elif ir_modifier == _M_X:
+                core[wpb_abs, _A_NUMBER] = irb_a_number * ira_b_number
+                core[wpb_abs, _B_NUMBER] = irb_b_number * ira_a_number
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            
+        elif ir_opcode == _DIV:
+            # Division by zero kills the process
+            div_ok = True
+            if ir_modifier == _M_A:
+                if ira_a_number != 0:
+                    core[wpb_abs, _A_NUMBER] = irb_a_number // ira_a_number
+                else:
+                    div_ok = False
+            elif ir_modifier == _M_B:
+                if ira_b_number != 0:
+                    core[wpb_abs, _B_NUMBER] = irb_b_number // ira_b_number
+                else:
+                    div_ok = False
+            elif ir_modifier == _M_AB:
+                if ira_a_number != 0:
+                    core[wpb_abs, _B_NUMBER] = irb_b_number // ira_a_number
+                else:
+                    div_ok = False
+            elif ir_modifier == _M_BA:
+                if ira_b_number != 0:
+                    core[wpb_abs, _A_NUMBER] = irb_a_number // ira_b_number
+                else:
+                    div_ok = False
+            elif ir_modifier == _M_F or ir_modifier == _M_I:
+                if ira_a_number != 0 and ira_b_number != 0:
+                    core[wpb_abs, _A_NUMBER] = irb_a_number // ira_a_number
+                    core[wpb_abs, _B_NUMBER] = irb_b_number // ira_b_number
+                else:
+                    div_ok = False
+            elif ir_modifier == _M_X:
+                if ira_a_number != 0 and ira_b_number != 0:
+                    core[wpb_abs, _A_NUMBER] = irb_a_number // ira_b_number
+                    core[wpb_abs, _B_NUMBER] = irb_b_number // ira_a_number
+                else:
+                    div_ok = False
+            if div_ok:
+                _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+                
+        elif ir_opcode == _MOD:
+            # Mod by zero kills the process
+            mod_ok = True
+            if ir_modifier == _M_A:
+                if ira_a_number != 0:
+                    core[wpb_abs, _A_NUMBER] = irb_a_number % ira_a_number
+                else:
+                    mod_ok = False
+            elif ir_modifier == _M_B:
+                if ira_b_number != 0:
+                    core[wpb_abs, _B_NUMBER] = irb_b_number % ira_b_number
+                else:
+                    mod_ok = False
+            elif ir_modifier == _M_AB:
+                if ira_a_number != 0:
+                    core[wpb_abs, _B_NUMBER] = irb_b_number % ira_a_number
+                else:
+                    mod_ok = False
+            elif ir_modifier == _M_BA:
+                if ira_b_number != 0:
+                    core[wpb_abs, _A_NUMBER] = irb_a_number % ira_b_number
+                else:
+                    mod_ok = False
+            elif ir_modifier == _M_F or ir_modifier == _M_I:
+                if ira_a_number != 0 and ira_b_number != 0:
+                    core[wpb_abs, _A_NUMBER] = irb_a_number % ira_a_number
+                    core[wpb_abs, _B_NUMBER] = irb_b_number % ira_b_number
+                else:
+                    mod_ok = False
+            elif ir_modifier == _M_X:
+                if ira_a_number != 0 and ira_b_number != 0:
+                    core[wpb_abs, _A_NUMBER] = irb_a_number % ira_b_number
+                    core[wpb_abs, _B_NUMBER] = irb_b_number % ira_a_number
+                else:
+                    mod_ok = False
+            if mod_ok:
+                _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+                
+        elif ir_opcode == _JMP:
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+            
+        elif ir_opcode == _JMZ:
+            if ir_modifier == _M_A or ir_modifier == _M_BA:
+                if irb_a_number == 0:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+                else:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            elif ir_modifier == _M_B or ir_modifier == _M_AB:
+                if irb_b_number == 0:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+                else:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            else:  # M_F, M_X, M_I
+                if irb_a_number == 0 and irb_b_number == 0:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+                else:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+                    
+        elif ir_opcode == _JMN:
+            if ir_modifier == _M_A or ir_modifier == _M_BA:
+                if irb_a_number != 0:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+                else:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            elif ir_modifier == _M_B or ir_modifier == _M_AB:
+                if irb_b_number != 0:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+                else:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            else:  # M_F, M_X, M_I
+                if irb_a_number != 0 or irb_b_number != 0:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+                else:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+                    
+        elif ir_opcode == _DJN:
+            if ir_modifier == _M_A or ir_modifier == _M_BA:
+                core[wpb_abs, _A_NUMBER] -= 1
+                if core[wpb_abs, _A_NUMBER] != 0:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+                else:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            elif ir_modifier == _M_B or ir_modifier == _M_AB:
+                core[wpb_abs, _B_NUMBER] -= 1
+                if core[wpb_abs, _B_NUMBER] != 0:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+                else:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            else:  # M_F, M_X, M_I
+                core[wpb_abs, _A_NUMBER] -= 1
+                core[wpb_abs, _B_NUMBER] -= 1
+                if core[wpb_abs, _A_NUMBER] != 0 or core[wpb_abs, _B_NUMBER] != 0:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+                else:
+                    _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+                    
+        elif ir_opcode == _SPL:
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + rpa, max_processes, coresize, coverage)
+            
+        elif ir_opcode == _SLT:
+            skip = False
+            if ir_modifier == _M_A:
+                skip = ira_a_number < irb_a_number
+            elif ir_modifier == _M_B:
+                skip = ira_b_number < irb_b_number
+            elif ir_modifier == _M_AB:
+                skip = ira_a_number < irb_b_number
+            elif ir_modifier == _M_BA:
+                skip = ira_b_number < irb_a_number
+            elif ir_modifier == _M_F:
+                skip = ira_a_number < irb_a_number and ira_b_number < irb_b_number
+            elif ir_modifier == _M_X:
+                skip = ira_a_number < irb_b_number and ira_b_number < irb_a_number
+            elif ir_modifier == _M_I:
+                skip = (ira_opcode == core[rpb_abs, _OPCODE] and
+                        ira_modifier == core[rpb_abs, _MODIFIER] and
+                        ira_a_mode == core[rpb_abs, _A_MODE] and
+                        ira_b_mode == core[rpb_abs, _B_MODE] and
+                        ira_a_number < irb_a_number and ira_b_number < irb_b_number)
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + (2 if skip else 1), max_processes, coresize, coverage)
+
+        elif ir_opcode == _CMP or ir_opcode == _SEQ:
+            skip = False
+            if ir_modifier == _M_A:
+                skip = ira_a_number == irb_a_number
+            elif ir_modifier == _M_B:
+                skip = ira_b_number == irb_b_number
+            elif ir_modifier == _M_AB:
+                skip = ira_a_number == irb_b_number
+            elif ir_modifier == _M_BA:
+                skip = ira_b_number == irb_a_number
+            elif ir_modifier == _M_F:
+                skip = ira_a_number == irb_a_number and ira_b_number == irb_b_number
+            elif ir_modifier == _M_X:
+                skip = ira_a_number == irb_b_number and ira_b_number == irb_a_number
+            elif ir_modifier == _M_I:
+                irb_full = core[rpb_abs]
+                skip = (ira_opcode == irb_full[_OPCODE] and
+                        ira_modifier == irb_full[_MODIFIER] and
+                        ira_a_mode == irb_full[_A_MODE] and
+                        ira_b_mode == irb_full[_B_MODE] and
+                        ira_a_number == irb_full[_A_NUMBER] and
+                        ira_b_number == irb_full[_B_NUMBER])
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + (2 if skip else 1), max_processes, coresize, coverage)
+
+        elif ir_opcode == _SNE:
+            skip = False
+            if ir_modifier == _M_A:
+                skip = ira_a_number != irb_a_number
+            elif ir_modifier == _M_B:
+                skip = ira_b_number != irb_b_number
+            elif ir_modifier == _M_AB:
+                skip = ira_a_number != irb_b_number
+            elif ir_modifier == _M_BA:
+                skip = ira_b_number != irb_a_number
+            elif ir_modifier == _M_F:
+                skip = ira_a_number != irb_a_number or ira_b_number != irb_b_number
+            elif ir_modifier == _M_X:
+                skip = ira_a_number != irb_b_number or ira_b_number != irb_a_number
+            elif ir_modifier == _M_I:
+                irb_full = core[rpb_abs]
+                skip = not (ira_opcode == irb_full[_OPCODE] and
+                           ira_modifier == irb_full[_MODIFIER] and
+                           ira_a_mode == irb_full[_A_MODE] and
+                           ira_b_mode == irb_full[_B_MODE] and
+                           ira_a_number == irb_full[_A_NUMBER] and
+                           ira_b_number == irb_full[_B_NUMBER])
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + (2 if skip else 1), max_processes, coresize, coverage)
+            
+        elif ir_opcode == _NOP:
+            _enqueue(task_queues, tq_heads, tq_tails, tq_sizes, w_idx, pc + 1, max_processes, coresize, coverage)
+
+
+@njit(cache=True)
+def _run_n_steps(core, num_warriors, task_queues, tq_heads, tq_tails, tq_sizes,
+                 coresize, max_processes, n_steps, coverage=None):
+    """Run n simulation steps in compiled code, avoiding Python call overhead per cycle."""
+    for _ in range(n_steps):
+        _step_numba(core, num_warriors, task_queues, tq_heads, tq_tails, tq_sizes,
+                    coresize, max_processes, coverage)
+
+
+class MARS(object):
+    """The MARS. Encapsulates a simulation with Numba-optimized step function."""
+
     def __init__(self, core=None, warriors=None, minimum_separation=100,
-                 randomize=True, max_processes=None):
-        self.core = core if core else Core()
+                 randomize=True, max_processes=None, debug=False, track_coverage=False):
         self.minimum_separation = minimum_separation
-        self.max_processes = max_processes if max_processes else len(self.core)
         self.warriors = warriors if warriors else []
+        self.cycle = 0
+        self.track_coverage = track_coverage
+        self.warrior_cov = {}
+        
+        # Determine core size
+        if core:
+            self._legacy_core = core
+            self.coresize = len(core)
+        else:
+            self._legacy_core = Core()
+            self.coresize = len(self._legacy_core)
+        
+        self.max_processes = max_processes if max_processes else self.coresize
+        
+        # Initialize numpy arrays for core: (coresize, 6)
+        # [opcode, modifier, a_mode, b_mode, a_number, b_number]
+        self._core = np.zeros((self.coresize, 6), dtype=np.int32)
+        
+        # Initialize task queue arrays
+        num_warriors = len(self.warriors) if self.warriors else 1
+        self._task_queues = np.zeros((num_warriors, self.max_processes), dtype=np.int32)
+        self._tq_heads = np.zeros(num_warriors, dtype=np.int32)
+        self._tq_tails = np.zeros(num_warriors, dtype=np.int32)
+        self._tq_sizes = np.zeros(num_warriors, dtype=np.int32)
+        
+        # Coverage tracking array (num_warriors, coresize) - only allocated if needed
+        self._coverage = np.zeros((num_warriors, self.coresize), dtype=np.bool_) if track_coverage else None
+
         if self.warriors:
             self.load_warriors(randomize)
 
     def core_event(self, warrior, address, event_type):
-        """Supposed to be implemented by subclasses to handle core
-           events.
-        """
-        i = self.core[address]
-        assert isinstance(i.a_number, int), f"Expected int but got {type(i.a_number)}"
-        assert isinstance(i.b_number, int), f"Expected int but got {type(i.b_number)}"
-        i.a_number = min(max(i.a_number, -999999999), 999999999)
-        i.b_number = min(max(i.b_number, -999999999), 999999999)
-        assert i.a_number < 1000000000 and i.a_number > -1000000000, f"a_number out of bounds"
-        assert i.b_number < 1000000000 and i.b_number > -1000000000, f"b_number out of bounds"
+        """For compatibility - no-op in numba version."""
+        pass
 
     def reset(self, clear_instruction=DEFAULT_INITIAL_INSTRUCTION):
         "Clears core and re-loads warriors."
-        self.core.clear(clear_instruction)
+        self._core.fill(0)
         self.load_warriors()
 
     def load_warriors(self, randomize=True):
-        "Loads its warriors to the memory with starting task queues"
-
-        # the space between warriors - equally spaced in the core
-        space = len(self.core) // len(self.warriors)
+        "Loads warriors to memory with starting task queues"
+        
+        space = self.coresize // len(self.warriors)
 
         for n, warrior in enumerate(self.warriors):
-            # position is in the nth equally separated space plus a random
-            # shift up to where the last instruction is minimum separated from
-            # the first instruction of the next warrior
-            warrior_position = (n * space)
+            warrior_position = n * space
 
             if randomize:
-                warrior_position += randint(0, max(0, space -
-                                                      len(warrior) -
-                                                      self.minimum_separation))
+                warrior_position += randint(0, max(0, space - len(warrior) - self.minimum_separation))
 
-            # add first and unique warrior task
-            warrior.task_queue = [self.core.trim(warrior_position + warrior.start)]
+            # Set up task queue for this warrior
+            start_addr = (warrior_position + warrior.start) % self.coresize
+            self._task_queues[n, 0] = start_addr
+            self._tq_heads[n] = 0
+            self._tq_tails[n] = 1
+            self._tq_sizes[n] = 1
+            
+            # Mark initial position in coverage
+            if self._coverage is not None:
+                self._coverage[n, start_addr] = True
+            
+            # Also set legacy task_queue for compatibility with corewar_util
+            warrior.task_queue = deque([start_addr])
 
-            # copy warrior's instructions to the core
+            # Copy warrior's instructions to the numpy core
             for i, instruction in enumerate(warrior.instructions):
-                self.core[warrior_position + i] = copy(instruction)
-                self.core_event(warrior, warrior_position + i, EVENT_I_WRITE)
-
-    def enqueue(self, warrior, address):
-        """Enqueue another process into the warrior's task queue. Only if it's
-           not already full.
-        """
-        if len(warrior.task_queue) < self.max_processes:
-            warrior.task_queue.append(self.core.trim(address))
-
-    def __iter__(self):
-        return iter(self.core)
-
-    def __len__(self):
-        return len(self.core)
-
-    def __getitem__(self, address):
-        return self.core[address]
+                addr = (warrior_position + i) % self.coresize
+                self._core[addr, _OPCODE] = instruction.opcode
+                self._core[addr, _MODIFIER] = instruction.modifier
+                self._core[addr, _A_MODE] = instruction.a_mode
+                self._core[addr, _B_MODE] = instruction.b_mode
+                self._core[addr, _A_NUMBER] = instruction.a_number
+                self._core[addr, _B_NUMBER] = instruction.b_number
 
     def step(self):
-        """Run one simulation step: execute one task of every active warrior.
-        """
-        for warrior in self.warriors:
-            if warrior.task_queue:
-                # The process counter is the next instruction-address in the
-                # warrior's task queue
-                pc = warrior.task_queue.pop(0)
+        """Run one simulation step using numba-optimized function."""
+        self.cycle += 1
+        _step_numba(
+            self._core,
+            len(self.warriors),
+            self._task_queues,
+            self._tq_heads,
+            self._tq_tails,
+            self._tq_sizes,
+            self.coresize,
+            self.max_processes,
+            self._coverage,
+        )
 
-                # copy the current instruction to the instruction register
-                ir = copy(self.core[pc])
+    def run_n_steps(self, n):
+        """Run n simulation steps in a single compiled call (avoids per-step Python overhead)."""
+        _run_n_steps(
+            self._core,
+            len(self.warriors),
+            self._task_queues,
+            self._tq_heads,
+            self._tq_tails,
+            self._tq_sizes,
+            self.coresize,
+            self.max_processes,
+            n,
+            self._coverage,
+        )
+        self.cycle += n
 
-                # evaluate the A-operand
-                if ir.a_mode == IMMEDIATE:
-                    # if the mode is immediate, reading and writing a-pointers
-                    # are zero
-                    rpa = wpa = 0
+    def get_queue_sizes(self):
+        """Return array of task queue sizes for each warrior."""
+        return self._tq_sizes.copy()
+    
+    def get_coverage_sums(self):
+        """Return array of coverage sums for each warrior."""
+        if self._coverage is not None:
+            return self._coverage.sum(axis=1)
+        return np.zeros(len(self.warriors), dtype=int)
+    
+    def sync_queues(self):
+        """Sync numpy task queues back to warrior.task_queue deques (for compatibility)."""
+        for i, warrior in enumerate(self.warriors):
+            warrior.task_queue.clear()
+            if self._tq_sizes[i] > 0:
+                head = self._tq_heads[i]
+                for j in range(self._tq_sizes[i]):
+                    idx = (head + j) % self.max_processes
+                    addr = self._task_queues[i, idx]
+                    warrior.task_queue.append(addr)
+            # Populate legacy warrior_cov dict from numpy array
+            if self._coverage is not None:
+                self.warrior_cov[warrior] = self._coverage[i]
 
-                else:
-                    # not immediate: direct or one of the indirect modes
-                    rpa = self.core.trim_read(ir.a_number)
-                    wpa = self.core.trim_write(ir.a_number)
+    def __iter__(self):
+        return iter(self._legacy_core)
 
-                    if ir.a_mode != DIRECT:
-                        # one of the indirect modes
+    def __len__(self):
+        return self.coresize
 
-                        # save this in case we need to use to post-increment
-                        pip = pc + wpa
+    def __getitem__(self, address):
+        return self._legacy_core[address]
 
-                        # pre-decrement, if needed
-                        if ir.a_mode == PREDEC_A:
-                            self.core[pc + wpa].a_number -= 1
-                            self.core_event(warrior, pc + wpa, EVENT_A_DEC)
-                        elif ir.a_mode == PREDEC_B:
-                            self.core[pc + wpa].b_number -= 1
-                            self.core_event(warrior, pc + wpa, EVENT_B_DEC)
-
-                        # calculate the indirect address, from A or B number
-                        if ir.a_mode in (PREDEC_A, INDIRECT_A, POSTINC_A):
-                            rpa = self.core.trim_read(rpa + self.core[pc + rpa].a_number)
-                            wpa = self.core.trim_write(wpa + self.core[pc + wpa].a_number)
-                        else:
-                            rpa = self.core.trim_read(rpa + self.core[pc + rpa].b_number)
-                            wpa = self.core.trim_write(wpa + self.core[pc + wpa].b_number)
-
-                # copy instruction pointer by A
-                ira = copy(self.core[pc + rpa])
-
-                # post-increment, if needed
-                if ir.a_mode == POSTINC_A:
-                    self.core[pip].a_number += 1
-                    self.core_event(warrior, pip, EVENT_A_INC)
-                elif ir.a_mode == POSTINC_B:
-                    self.core[pip].b_number += 1
-                    self.core_event(warrior, pip, EVENT_B_INC)
-
-                # evaluate the B-operand - pretty much the same as A
-                if ir.b_mode == IMMEDIATE:
-                    rpb = wpb = 0
-                else:
-                    rpb = self.core.trim_read(ir.b_number)
-                    wpb = self.core.trim_write(ir.b_number)
-
-                    if ir.b_mode != DIRECT:
-                        pip = pc + wpb
-
-                        if ir.b_mode == PREDEC_A:
-                            self.core[pc + wpb].a_number -= 1
-                            self.core_event(warrior, pc + wpb, EVENT_A_DEC)
-                        elif ir.b_mode == PREDEC_B:
-                            self.core[pc + wpb].b_number -= 1
-                            self.core_event(warrior, pc + wpb, EVENT_B_DEC)
-
-                        if ir.b_mode in (PREDEC_A, INDIRECT_A, POSTINC_A):
-                            rpb = self.core.trim_read(rpb + self.core[pc + rpb].a_number)
-                            wpb = self.core.trim_write(wpb + self.core[pc + wpb].a_number)
-                        else:
-                            rpb = self.core.trim_read(rpb + self.core[pc + rpb].b_number)
-                            wpb = self.core.trim_write(wpb + self.core[pc + wpb].b_number)
-
-                irb = copy(self.core[pc + rpb])
-
-                if ir.b_mode == POSTINC_A:
-                    self.core[pip].a_number += 1
-                    self.core_event(warrior, pip, EVENT_A_INC)
-                elif ir.b_mode == POSTINC_B:
-                    self.core[pip].b_number += 1
-                    self.core_event(warrior, pip, EVENT_B_INC)
-
-                # arithmetic common code
-                def do_arithmetic(op):
-                    try:
-                        if ir.modifier == M_A:
-                            self.core[pc + wpb].a_number = op(irb.a_number, ira.a_number)
-                            self.core_event(warrior, pc + wpb, EVENT_A_WRITE)
-                            self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                            self.core_event(warrior, pc + rpb, EVENT_A_READ)
-                        elif ir.modifier == M_B:
-                            self.core[pc + wpb].b_number = op(irb.b_number, ira.b_number)
-                            self.core_event(warrior, pc + wpb, EVENT_B_WRITE)
-                            self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                            self.core_event(warrior, pc + rpb, EVENT_B_READ)
-                        elif ir.modifier == M_AB:
-                            self.core[pc + wpb].b_number = op(irb.b_number, ira.a_number)
-                            self.core_event(warrior, pc + wpb, EVENT_B_WRITE)
-                            self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                            self.core_event(warrior, pc + rpb, EVENT_B_READ)
-                        elif ir.modifier == M_BA:
-                            self.core[pc + wpb].a_number = op(irb.b_number, ira.a_number)
-                            self.core_event(warrior, pc + wpb, EVENT_A_WRITE)
-                            self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                            self.core_event(warrior, pc + rpb, EVENT_B_READ)
-                        elif ir.modifier == M_F or ir.modifier == M_I:
-                            self.core[pc + wpb].a_number = op(irb.a_number, ira.a_number)
-                            self.core[pc + wpb].b_number = op(irb.b_number, ira.b_number)
-                            self.core_event(warrior, pc + wpb, EVENT_A_WRITE)
-                            self.core_event(warrior, pc + wpb, EVENT_B_WRITE)
-                            self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                            self.core_event(warrior, pc + rpb, EVENT_A_READ)
-                            self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                            self.core_event(warrior, pc + rpb, EVENT_B_READ)
-                        elif ir.modifier == M_X:
-                            self.core[pc + wpb].b_number = op(irb.b_number, ira.a_number)
-                            self.core[pc + wpb].a_number = op(irb.a_number, ira.b_number)
-                            self.core_event(warrior, pc + wpb, EVENT_A_WRITE)
-                            self.core_event(warrior, pc + wpb, EVENT_B_WRITE)
-                            self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                            self.core_event(warrior, pc + rpb, EVENT_A_READ)
-                            self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                            self.core_event(warrior, pc + rpb, EVENT_B_READ)
-                        else:
-                            raise ValueError("Invalid modifier: %d" % ir.modifier)
-
-                        # enqueue next instruction
-                        self.enqueue(warrior, pc + 1)
-                    except ZeroDivisionError:
-                        pass
-
-                # comparison common code
-                def do_comparison(cmp):
-                    if ir.modifier == M_A:
-                        self.enqueue(warrior,
-                                     pc + (2 if cmp(ira.a_number, irb.a_number) else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpb, EVENT_A_READ)
-                    elif ir.modifier == M_B:
-                        self.enqueue(warrior,
-                                     pc + (2 if cmp(ira.b_number, irb.b_number) else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                        self.core_event(warrior, pc + rpb, EVENT_B_READ)
-                    elif ir.modifier == M_AB:
-                        self.enqueue(warrior,
-                                     pc + (2 if cmp(ira.a_number, irb.b_number) else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpb, EVENT_B_READ)
-                    elif ir.modifier == M_BA:
-                        self.enqueue(warrior,
-                                     pc + (2 if cmp(ira.b_number, irb.a_number) else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                        self.core_event(warrior, pc + rpb, EVENT_A_READ)
-                    elif ir.modifier == M_F:
-                        self.enqueue(warrior,
-                                     pc + (2 if cmp(ira.a_number, irb.a_number) and
-                                                cmp(ira.b_number, irb.b_number) else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpb, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                        self.core_event(warrior, pc + rpb, EVENT_B_READ)
-                    elif ir.modifier == M_X:
-                        self.enqueue(warrior,
-                                     pc + (2 if cmp(ira.a_number, irb.b_number) and
-                                                cmp(ira.b_number, irb.a_number) else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpb, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                        self.core_event(warrior, pc + rpb, EVENT_B_READ)
-                    elif ir.modifier == M_I:
-                        self.enqueue(warrior,
-                                     pc + (2 if ira == irb else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_I_READ)
-                        self.core_event(warrior, pc + rpb, EVENT_I_READ)
-                    else:
-                        raise ValueError("Invalid modifier: %d" % ir.modifier)
-
-                self.core_event(warrior, pc, EVENT_EXECUTED)
-
-                if ir.opcode == DAT:
-                    # does not enqueue next instruction, therefore, killing the
-                    # process
-                    pass
-                elif ir.opcode == MOV:
-                    if ir.modifier == M_A:
-                        self.core[pc + wpb].a_number = ira.a_number
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + wpb, EVENT_A_WRITE)
-                    elif ir.modifier == M_B:
-                        self.core[pc + wpb].b_number = ira.b_number
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                        self.core_event(warrior, pc + wpb, EVENT_B_WRITE)
-                    elif ir.modifier == M_AB:
-                        self.core[pc + wpb].b_number = ira.a_number
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + wpb, EVENT_B_WRITE)
-                    elif ir.modifier == M_BA:
-                        self.core[pc + wpb].a_number = ira.b_number
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                        self.core_event(warrior, pc + wpb, EVENT_A_WRITE)
-                    elif ir.modifier == M_F:
-                        self.core[pc + wpb].a_number = ira.a_number
-                        self.core[pc + wpb].b_number = ira.b_number
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                        self.core_event(warrior, pc + wpb, EVENT_A_WRITE)
-                        self.core_event(warrior, pc + wpb, EVENT_B_WRITE)
-                    elif ir.modifier == M_X:
-                        self.core[pc + wpb].b_number = ira.a_number
-                        self.core[pc + wpb].a_number = ira.b_number
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                        self.core_event(warrior, pc + wpb, EVENT_A_WRITE)
-                        self.core_event(warrior, pc + wpb, EVENT_B_WRITE)
-                    elif ir.modifier == M_I:
-                        self.core[pc + wpb] = ira
-                        self.core_event(warrior, pc + rpa, EVENT_I_READ)
-                        self.core_event(warrior, pc + wpb, EVENT_I_WRITE)
-                    else:
-                        raise ValueError("Invalid modifier: %d" % ir.modifier)
-
-                    # enqueue next instruction
-                    self.enqueue(warrior, pc + 1)
-                elif ir.opcode == ADD:
-                    do_arithmetic(operator.add)
-                elif ir.opcode == SUB:
-                    do_arithmetic(operator.sub)
-                elif ir.opcode == MUL:
-                    do_arithmetic(operator.mul)
-                elif ir.opcode == DIV:
-                    do_arithmetic(operator.floordiv)
-                elif ir.opcode == MOD:
-                    do_arithmetic(operator.mod)
-                elif ir.opcode == JMP:
-                    self.enqueue(warrior, pc + rpa)
-                elif ir.opcode == JMZ:
-                    if ir.modifier == M_A or ir.modifier == M_BA:
-                        self.enqueue(warrior, pc + (rpa if irb.a_number == 0 else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                    elif ir.modifier == M_B or ir.modifier == M_AB:
-                        self.enqueue(warrior, pc + (rpa if irb.b_number == 0 else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                    elif ir.modifier in (M_F, M_X, M_I):
-                        self.enqueue(warrior,
-                                     pc + (rpa if irb.a_number == irb.b_number == 0 else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                    else:
-                        raise ValueError("Invalid modifier: %d" % ir.modifier)
-                elif ir.opcode == JMN:
-                    if ir.modifier == M_A or ir.modifier == M_BA:
-                        self.enqueue(warrior, pc + (rpa if irb.a_number != 0 else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                    elif ir.modifier == M_B or ir.modifier == M_AB:
-                        self.enqueue(warrior, pc + (rpa if irb.b_number != 0 else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                    elif ir.modifier in (M_F, M_X, M_I):
-                        self.enqueue(warrior,
-                                     pc + (rpa if irb.a_number != 0 or
-                                                  irb.b_number != 0 else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                    else:
-                        raise ValueError("Invalid modifier: %d" % ir.modifier)
-                elif ir.opcode == DJN:
-                    if ir.modifier == M_A or ir.modifier == M_BA:
-                        self.core[pc + wpb].a_number -= 1
-                        irb.a_number -= 1
-                        self.enqueue(warrior, pc + (rpa if irb.a_number != 0 else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpa, EVENT_A_DEC)
-                    elif ir.modifier == M_B or ir.modifier == M_AB:
-                        self.core[pc + wpb].b_number -= 1
-                        irb.b_number -= 1
-                        self.enqueue(warrior, pc + (rpa if irb.b_number != 0 else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                        self.core_event(warrior, pc + rpa, EVENT_B_DEC)
-                    elif ir.modifier in (M_F, M_X, M_I):
-                        self.core[pc + wpb].a_number -= 1
-                        irb.a_number -= 1
-                        self.core[pc + wpb].b_number -= 1
-                        irb.b_number -= 1
-                        self.enqueue(warrior,
-                                     pc + (rpa if irb.a_number != 0 or
-                                                  irb.b_number != 0 else 1))
-                        self.core_event(warrior, pc + rpa, EVENT_A_READ)
-                        self.core_event(warrior, pc + rpa, EVENT_B_READ)
-                        self.core_event(warrior, pc + rpa, EVENT_A_DEC)
-                        self.core_event(warrior, pc + rpa, EVENT_B_DEC)
-                    else:
-                        raise ValueError("Invalid modifier: %d" % ir.modifier)
-                elif ir.opcode == SPL:
-                    self.enqueue(warrior, pc + 1)
-                    self.enqueue(warrior, pc + rpa)
-                elif ir.opcode == SLT:
-                    do_comparison(operator.lt)
-                elif ir.opcode == CMP or ir.opcode == SEQ:
-                    do_comparison(operator.eq)
-                elif ir.opcode == SNE:
-                    do_comparison(operator.ne)
-                elif ir.opcode == NOP:
-                    self.enqueue(warrior, pc + 1)
-                else:
-                    raise ValueError("Invalid opcode: %d" % ir.opcode)
-
-if __name__ == "__main__":
-    import argparse
-    import redcode
-
-    parser = argparse.ArgumentParser(description='MARS (Memory Array Redcode Simulator)')
-    parser.add_argument('--rounds', '-r', metavar='ROUNDS', type=int, nargs='?',
-                        default=1, help='Rounds to play')
-    parser.add_argument('--size', '-s', metavar='CORESIZE', type=int, nargs='?',
-                        default=8000, help='The core size')
-    parser.add_argument('--cycles', '-c', metavar='CYCLES', type=int, nargs='?',
-                        default=80000, help='Cycles until tie')
-    parser.add_argument('--processes', '-p', metavar='MAXPROCESSES', type=int, nargs='?',
-                        default=8000, help='Max processes')
-    parser.add_argument('--length', '-l', metavar='MAXLENGTH', type=int, nargs='?',
-                        default=100, help='Max warrior length')
-    parser.add_argument('--distance', '-d', metavar='MINDISTANCE', type=int, nargs='?',
-                        default=100, help='Minimum warrior distance')
-    parser.add_argument('warriors', metavar='WARRIOR', type=file, nargs='+',
-                        help='Warrior redcode filename')
-
-    args = parser.parse_args()
-
-    # build environment
-    environment = {'CORESIZE': args.size,
-                   'CYCLES': args.cycles,
-                   'ROUNDS': args.rounds,
-                   'MAXPROCESSES': args.processes,
-                   'MAXLENGTH': args.length,
-                   'MINDISTANCE': args.distance}
-
-    # assemble warriors
-    warriors = [redcode.parse(file, environment) for file in args.warriors]
-
-    # initialize wins, losses and ties for each warrior
-    for warrior in warriors:
-        warrior.wins = warrior.ties = warrior.losses = 0
-
-    # for each round
-    for i in range(args.rounds):
-
-        # create new simulation
-        simulation = MARS(warriors=warriors,
-                          minimum_separation = args.distance,
-                          max_processes = args.processes)
-
-        active_warrior_to_stop = 1 if len(warriors) >= 2 else 0
-
-        for c in range(args.cycles):
-            simulation.step()
-
-            # if there's only one left, or are all dead, then stop simulation
-            if sum(1 if warrior.task_queue else 0 for warrior in warriors) <= active_warrior_to_stop:
-                for warrior in warriors:
-                    if warrior.task_queue:
-                        warrior.wins += 1
-                    else:
-                        warrior.losses += 1
-                break
-        else:
-            # running until max cycles: tie
-            for warrior in warriors:
-                if warrior.task_queue:
-                    warrior.ties += 1
-                else:
-                    warrior.losses += 1
-
-    # print results
-    print("Results: ({} rounds)".format(args.rounds))
-    print("{} {} {} {}".format("Warrior (Author)".ljust(40), "wins".rjust(5),
-                              "ties".rjust(5), "losses".rjust(5)))
-    for warrior in warriors:
-        print("{} {} {} {}".format(("{} ({})".format(warrior.name, warrior.author)).ljust(40),
-                                  str(warrior.wins).rjust(5),
-                                  str(warrior.ties).rjust(5),
-                                  str(warrior.losses).rjust(5)))
-
-
+    # Property to access core for compatibility
+    @property
+    def core(self):
+        return self._legacy_core
